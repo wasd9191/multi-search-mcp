@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Multi-search MCP server** – 一个轻量级、无需 API 密钥的 MCP 服务器，为 LM Studio 等客户端提供百度、必应、搜狗三引擎聚合搜索能力。内置缓存、反爬策略和结果去重排序，**同时支持直接抓取任意 URL 的正文内容**。
+**aggregate-search-mcp** – 一个轻量级、无需 API 密钥的 MCP 服务器，为 LM Studio 等客户端提供百度、必应、搜狗三引擎聚合搜索能力。内置缓存、反爬策略和结果去重排序，**同时支持直接抓取任意 URL 的正文内容**。
 
 ## ✨ 特性
 
@@ -22,8 +22,8 @@
 ### 1. 克隆并安装依赖
 
 ```bash
-git clone https://github.com/你的用户名/multi-search-mcp.git
-cd multi-search-mcp
+git clone https://github.com/你的用户名/aggregate-search-mcp.git
+cd aggregate-search-mcp
 npm install
 
 
@@ -37,7 +37,7 @@ npm install
   "mcpServers": {
     "multi-search": {
       "command": "node",
-      "args": ["/你的绝对路径/multi-search-mcp/index.js"],
+      "args": ["/你的绝对路径/aggregate-search-mcp/index.js"],
       "env": {}
     }
   }
