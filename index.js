@@ -4,20 +4,27 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { URLSearchParams } from 'url';
+import { Readability } from '@mozilla/readability';
+import { JSDOM } from 'jsdom';
+import puppeteer from 'puppeteer';
 
 // ============================
 // 1. 配置
 // ============================
 const CONFIG = {
-  cacheTTL: 5 * 60 * 1000,        // 缓存过期时间 5分钟
-  maxResults: 5,                  // 默认返回条数
-  requestTimeout: 15000,          // 请求超时 ms
-  delayBetweenRequests: 1000,     // 同一引擎连续请求间隔 ms
-  maxRetries: 2,                  // 失败重试次数
+  cacheTTL: 5 * 60 * 1000,          // 搜索结果缓存 5分钟
+  contentCacheTTL: 60 * 60 * 1000,  // 正文缓存 1小时
+  maxResults: 5,
+  requestTimeout: 15000,
+  maxRetries: 2,
+  maxContentLength: 500,
+  fetchTimeout: 10000,
+  usePuppeteerFallback: true,       // 当 axios 失败时尝试 puppeteer
+  proxy: process.env.PROXY || '',   // 可选代理
 };
 
 // ============================
-// 2. 工具函数：延迟 & UA轮换
+// 2. 工具函数：UA轮换、延迟
 // ============================
 const userAgents = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -31,129 +38,10 @@ const getNextUA = () => userAgents[uaIndex++ % userAgents.length];
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// 带重试的请求
-async function fetchWithRetry(url, options, retries = CONFIG.maxRetries) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await axios.get(url, {
-        ...options,
-        timeout: CONFIG.requestTimeout,
-      });
-      return response;
-    } catch (err) {
-      if (i === retries - 1) throw err;
-      await delay(2000 * (i + 1)); // 退避
-    }
-  }
-}
-
 // ============================
-// 3. 搜索引擎抓取器（均无需API）
+// 3. 缓存类
 // ============================
-
-// ---------- 百度 ----------
-async function fetchBaidu(query, max) {
-  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
-  const response = await fetchWithRetry(url, {
-    headers: {
-      'User-Agent': getNextUA(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    },
-  });
-  const $ = cheerio.load(response.data);
-  const results = [];
-  const selectors = ['.result', '.c-container'];
-  let found = false;
-  for (const sel of selectors) {
-    const elems = $(sel);
-    if (elems.length > 0) {
-      elems.each((i, elem) => {
-        if (i >= max) return false;
-        const titleElem = $(elem).find('h3 a, .t a');
-        let title = titleElem.text().trim();
-        let link = titleElem.attr('href');
-        if (!title || !link) return;
-        // 处理百度跳转
-        if (link.startsWith('/url?q=')) {
-          const qs = new URLSearchParams(link.split('?')[1]);
-          link = qs.get('q') || link;
-        } else if (link && !link.startsWith('http')) {
-          link = 'https://www.baidu.com' + link;
-        }
-        const snippet = $(elem).find('.c-abstract, .content-abstract, .abs').text().trim();
-        results.push({ title, link, snippet, source: 'baidu' });
-      });
-      if (results.length > 0) { found = true; break; }
-    }
-  }
-  return results;
-}
-
-// ---------- 必应 (Bing) ----------
-async function fetchBing(query, max) {
-  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
-  const response = await fetchWithRetry(url, {
-    headers: {
-      'User-Agent': getNextUA(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    },
-  });
-  const $ = cheerio.load(response.data);
-  const results = [];
-  $('#b_results .b_algo').each((i, elem) => {
-    if (i >= max) return false;
-    const titleElem = $(elem).find('h2 a');
-    const title = titleElem.text().trim();
-    let link = titleElem.attr('href');
-    if (!title || !link) return;
-    // Bing 可能使用 /url?q= 类似跳转
-    if (link.startsWith('/url?q=')) {
-      const qs = new URLSearchParams(link.split('?')[1]);
-      link = qs.get('q') || link;
-    }
-    const snippet = $(elem).find('.b_caption p').text().trim();
-    results.push({ title, link, snippet, source: 'bing' });
-  });
-  return results;
-}
-
-// ---------- 搜狗 (Sogou) ----------
-async function fetchSogou(query, max) {
-  const url = `https://www.sogou.com/web?query=${encodeURIComponent(query)}`;
-  const response = await fetchWithRetry(url, {
-    headers: {
-      'User-Agent': getNextUA(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    },
-  });
-  const $ = cheerio.load(response.data);
-  const results = [];
-  $('.vrwrap, .rb, .pt').each((i, elem) => {
-    if (i >= max) return false;
-    const titleElem = $(elem).find('h3 a, .pt a');
-    let title = titleElem.text().trim();
-    let link = titleElem.attr('href');
-    if (!title || !link) return;
-    // 处理搜狗跳转
-    if (link.startsWith('/link?url=')) {
-      const qs = new URLSearchParams(link.split('?')[1]);
-      link = qs.get('url') || link;
-    } else if (link && !link.startsWith('http')) {
-      link = 'https://www.sogou.com' + link;
-    }
-    const snippet = $(elem).find('.p, .str_info').text().trim();
-    results.push({ title, link, snippet, source: 'sogou' });
-  });
-  return results;
-}
-
-// ============================
-// 4. 缓存（LRU + TTL）
-// ============================
-class SearchCache {
+class Cache {
   constructor(ttl) {
     this.ttl = ttl;
     this.cache = new Map();
@@ -170,47 +58,219 @@ class SearchCache {
   set(key, data) {
     this.cache.set(key, { data, timestamp: Date.now() });
   }
-  clear() {
-    this.cache.clear();
+}
+const searchCache = new Cache(CONFIG.cacheTTL);
+const contentCache = new Cache(CONFIG.contentCacheTTL);
+
+// ============================
+// 4. 搜索引擎抓取器（与之前相同）
+// ============================
+async function fetchBaidu(query, max) {
+  const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
+  const response = await axios.get(url, {
+    headers: { 'User-Agent': getNextUA(), 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    timeout: CONFIG.requestTimeout,
+  });
+  const $ = cheerio.load(response.data);
+  const results = [];
+  const selectors = ['.result', '.c-container'];
+  for (const sel of selectors) {
+    const elems = $(sel);
+    if (elems.length) {
+      elems.each((i, elem) => {
+        if (i >= max) return false;
+        const titleElem = $(elem).find('h3 a, .t a');
+        let title = titleElem.text().trim();
+        let link = titleElem.attr('href');
+        if (!title || !link) return;
+        if (link.startsWith('/url?q=')) {
+          const qs = new URLSearchParams(link.split('?')[1]);
+          link = qs.get('q') || link;
+        } else if (link && !link.startsWith('http')) {
+          link = 'https://www.baidu.com' + link;
+        }
+        const snippet = $(elem).find('.c-abstract, .content-abstract, .abs').text().trim();
+        results.push({ title, link, snippet, source: 'baidu' });
+      });
+      if (results.length) break;
+    }
+  }
+  return results;
+}
+
+async function fetchBing(query, max) {
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+  const response = await axios.get(url, {
+    headers: { 'User-Agent': getNextUA(), 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    timeout: CONFIG.requestTimeout,
+  });
+  const $ = cheerio.load(response.data);
+  const results = [];
+  $('#b_results .b_algo').each((i, elem) => {
+    if (i >= max) return false;
+    const titleElem = $(elem).find('h2 a');
+    const title = titleElem.text().trim();
+    let link = titleElem.attr('href');
+    if (!title || !link) return;
+    if (link.startsWith('/url?q=')) {
+      const qs = new URLSearchParams(link.split('?')[1]);
+      link = qs.get('q') || link;
+    }
+    const snippet = $(elem).find('.b_caption p').text().trim();
+    results.push({ title, link, snippet, source: 'bing' });
+  });
+  return results;
+}
+
+async function fetchSogou(query, max) {
+  const url = `https://www.sogou.com/web?query=${encodeURIComponent(query)}`;
+  const response = await axios.get(url, {
+    headers: { 'User-Agent': getNextUA(), 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    timeout: CONFIG.requestTimeout,
+  });
+  const $ = cheerio.load(response.data);
+  const results = [];
+  $('.vrwrap, .rb, .pt').each((i, elem) => {
+    if (i >= max) return false;
+    const titleElem = $(elem).find('h3 a, .pt a');
+    let title = titleElem.text().trim();
+    let link = titleElem.attr('href');
+    if (!title || !link) return;
+    if (link.startsWith('/link?url=')) {
+      const qs = new URLSearchParams(link.split('?')[1]);
+      link = qs.get('url') || link;
+    } else if (link && !link.startsWith('http')) {
+      link = 'https://www.sogou.com' + link;
+    }
+    const snippet = $(elem).find('.p, .str_info').text().trim();
+    results.push({ title, link, snippet, source: 'sogou' });
+  });
+  return results;
+}
+
+// ============================
+// 5. 正文抓取（增强版：axios + puppeteer 降级）
+// ============================
+async function fetchWithAxios(url) {
+  const response = await axios.get(url, {
+    headers: { 'User-Agent': getNextUA(), 'Accept': 'text/html,application/xhtml+xml' },
+    timeout: CONFIG.fetchTimeout,
+    maxRedirects: 5,
+    proxy: CONFIG.proxy ? { host: CONFIG.proxy, port: 8080 } : false,
+  });
+  const html = response.data;
+  const dom = new JSDOM(html);
+  const reader = new Readability(dom.window.document);
+  let article = reader.parse();
+  let content = '';
+  if (article && article.textContent && article.textContent.length > 50) {
+    content = article.textContent.trim();
+  } else {
+    // fallback: 常见容器
+    const $ = cheerio.load(html);
+    const selectors = ['article', 'main', '.content', '#content', '.post-content', '.article-content'];
+    for (const sel of selectors) {
+      const el = $(sel);
+      if (el.length) {
+        const text = el.text().trim();
+        if (text.length > 50) {
+          content = text;
+          break;
+        }
+      }
+    }
+    if (!content) {
+      const desc = $('meta[name="description"]').attr('content');
+      if (desc) content = desc;
+    }
+  }
+  return content || '';
+}
+
+async function fetchWithPuppeteer(url) {
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const page = await browser.newPage();
+    await page.setUserAgent(getNextUA());
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: CONFIG.fetchTimeout });
+    const content = await page.evaluate(() => {
+      const article = document.querySelector('article, main, .content, #content, .post-content');
+      return article ? article.innerText : document.body.innerText;
+    });
+    await browser.close();
+    return content || '';
+  } catch (err) {
+    if (browser) await browser.close();
+    console.error(`Puppeteer 抓取失败: ${err.message}`);
+    return '';
   }
 }
-const cache = new SearchCache(CONFIG.cacheTTL);
 
-// ============================
-// 5. 多引擎聚合、去重、排序
-// ============================
-async function searchAllEngines(query, maxResults) {
-  // 1) 从缓存获取
-  const cacheKey = `${query}_${maxResults}`;
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    console.error('✅ 命中缓存');
-    return cached;
+async function fetchPageContent(url) {
+  const cached = contentCache.get(url);
+  if (cached) return cached;
+
+  let content = '';
+  try {
+    content = await fetchWithAxios(url);
+  } catch (err) {
+    console.error(`Axios 抓取失败: ${err.message}`);
   }
 
-  // 2) 并行抓取所有引擎（每个引擎抓取 maxResults*2 条以丰富候选）
-  const engineFetchers = [
+  // 如果内容过短且允许 puppeteer 降级
+  if ((!content || content.length < 50) && CONFIG.usePuppeteerFallback) {
+    content = await fetchWithPuppeteer(url);
+  }
+
+  if (content) {
+    content = content.slice(0, CONFIG.maxContentLength) + (content.length > CONFIG.maxContentLength ? '...' : '');
+    contentCache.set(url, content);
+  }
+  return content || '';
+}
+
+// ============================
+// 6. 搜索聚合 + 正文抓取
+// ============================
+async function searchAllEngines(query, maxResults) {
+  const cacheKey = `${query}_${maxResults}`;
+  const cached = searchCache.get(cacheKey);
+  if (cached) {
+    console.error('✅ 命中搜索结果缓存');
+    // 重新抓取正文（利用正文缓存）
+    const withContent = await Promise.all(
+      cached.map(async (item) => {
+        if (item.link) {
+          const content = await fetchPageContent(item.link);
+          return { ...item, content };
+        }
+        return item;
+      })
+    );
+    return withContent;
+  }
+
+  // 并行抓取
+  const [baiduRes, bingRes, sogouRes] = await Promise.allSettled([
     fetchBaidu(query, maxResults * 2),
     fetchBing(query, maxResults * 2),
     fetchSogou(query, maxResults * 2),
-  ];
-  const resultsArrays = await Promise.allSettled(engineFetchers);
+  ]);
 
-  // 收集成功的结果
   let allResults = [];
-  resultsArrays.forEach((result, idx) => {
-    if (result.status === 'fulfilled') {
-      allResults = allResults.concat(result.value);
-    } else {
-      console.error(`⚠️ 引擎 ${['baidu','bing','sogou'][idx]} 抓取失败:`, result.reason.message);
-    }
+  const engines = ['baidu', 'bing', 'sogou'];
+  [baiduRes, bingRes, sogouRes].forEach((res, idx) => {
+    if (res.status === 'fulfilled') allResults = allResults.concat(res.value);
+    else console.error(`⚠️ 引擎 ${engines[idx]} 抓取失败:`, res.reason.message);
   });
 
-  if (allResults.length === 0) {
-    return [];
-  }
+  if (allResults.length === 0) return [];
 
-  // 3) 去重（基于链接，若链接不可靠则用标题前10字符）
+  // 去重
   const seen = new Set();
   const unique = [];
   for (const item of allResults) {
@@ -221,7 +281,7 @@ async function searchAllEngines(query, maxResults) {
     }
   }
 
-  // 4) 相关性排序（简单：关键词命中次数）
+  // 排序
   const keywords = query.split(/\s+/).filter(w => w.length > 1);
   const scored = unique.map(item => {
     let score = 0;
@@ -236,31 +296,41 @@ async function searchAllEngines(query, maxResults) {
 
   const finalResults = scored.slice(0, maxResults);
 
-  // 存入缓存
-  cache.set(cacheKey, finalResults);
+  // 抓取正文
+  const withContent = await Promise.all(
+    finalResults.map(async (item) => {
+      if (item.link) {
+        const content = await fetchPageContent(item.link);
+        return { ...item, content };
+      }
+      return item;
+    })
+  );
 
-  return finalResults;
+  // 缓存搜索结果（不含正文）
+  searchCache.set(cacheKey, finalResults.map(({ content, ...rest }) => rest));
+
+  return withContent;
 }
 
 // ============================
-// 6. MCP 服务器（修正版）
+// 7. MCP 服务器
 // ============================
 const server = new Server(
   {
     name: 'multi-engine-search-mcp',
-    version: '2.0.0',
+    version: '2.2.0',
   },
   {
     capabilities: { tools: {} },
   }
 );
 
-// 注册工具列表 - 使用 ListToolsRequestSchema
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'search',
-      description: '使用百度、必应、搜狗多引擎搜索中文网页，自动合并去重排序，支持缓存。',
+      description: '使用百度、必应、搜狗多引擎搜索中文网页，自动合并去重排序，支持缓存，并自动抓取前几条结果的正文内容。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -270,53 +340,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['query'],
       },
     },
+    {
+      name: 'fetch_url',
+      description: '直接抓取指定 URL 的网页正文内容，支持动态页面（通过 Puppeteer 降级）。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '完整的网页地址（包含 http:// 或 https://）' },
+          max_length: { type: 'number', description: '返回内容最大长度（默认 500 字符）' },
+        },
+        required: ['url'],
+      },
+    },
   ],
 }));
 
-// 处理工具调用 - 使用 CallToolRequestSchema
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  // 注意：request.params 结构为 { name, arguments }
-  if (request.params.name !== 'search') {
-    throw new Error(`未知工具: ${request.params.name}`);
-  }
+  const { name, arguments: args } = request.params;
 
-  const { query, max_results = CONFIG.maxResults } = request.params.arguments || {};
-  if (!query) {
-    throw new Error('缺少查询参数 query');
-  }
-
-  const max = Math.min(Math.max(parseInt(max_results) || CONFIG.maxResults, 1), 10);
-
-  try {
+  if (name === 'search') {
+    const { query, max_results = CONFIG.maxResults } = args || {};
+    if (!query) throw new Error('缺少查询参数 query');
+    const max = Math.min(Math.max(parseInt(max_results) || CONFIG.maxResults, 1), 10);
     const results = await searchAllEngines(query, max);
-
     if (results.length === 0) {
-      return {
-        content: [{ type: 'text', text: `😅 未找到关于“${query}”的搜索结果，请尝试其他关键词。` }],
-      };
+      return { content: [{ type: 'text', text: `😅 未找到关于“${query}”的搜索结果。` }] };
     }
-
-    // 格式化输出
     let text = `🔍 搜索“${query}”的结果（共 ${results.length} 条，来自 ${new Set(results.map(r=>r.source)).size} 个引擎）：\n\n`;
     results.forEach((r, i) => {
-      text += `${i + 1}. [${r.source}] ${r.title}\n`;
+      text += `${i+1}. [${r.source}] ${r.title}\n`;
       text += `   ${r.snippet || '（无摘要）'}\n`;
+      if (r.content) text += `   📄 ${r.content}\n`;
       text += `   🔗 ${r.link}\n\n`;
     });
+    return { content: [{ type: 'text', text }] };
+  }
 
+  if (name === 'fetch_url') {
+    const { url, max_length = 500 } = args || {};
+    if (!url) throw new Error('缺少 URL 参数');
+    try { new URL(url); } catch { throw new Error('无效的 URL'); }
+    const content = await fetchPageContent(url);
+    const finalContent = content || '（无法抓取内容，可能是反爬或页面结构复杂）';
     return {
-      content: [{ type: 'text', text }],
-    };
-  } catch (error) {
-    return {
-      content: [{ type: 'text', text: `❌ 搜索出错: ${error.message}` }],
+      content: [{ type: 'text', text: `📄 从 ${url} 抓取的内容（截取前 ${max_length} 字符）：\n\n${finalContent}` }],
     };
   }
+
+  throw new Error(`未知工具: ${name}`);
 });
 
 // ============================
-// 7. 启动
+// 8. 启动
 // ============================
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error('✅ 多引擎搜索 MCP 服务器已启动（百度+Bing+搜狗，缓存已启用）');
+console.error('✅ 多引擎搜索 MCP 服务器 v2.2.0 已启动（含 Puppeteer 降级抓取、URL 直接抓取）');
