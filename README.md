@@ -19,7 +19,7 @@
 ### 1. 克隆并安装依赖
 
 ```bash
-git clone https://github.com/你的用户名/multi-search-mcp.git
+git clone https://github.com/你的用户名/multi-search-mcp.git（这个用户名后面的路径就不要打了因为我突然发现这个js文件与json文件没有搞文件夹你需要自己创建一个文件夹并放进去）
 cd multi-search-mcp
 npm install
 
