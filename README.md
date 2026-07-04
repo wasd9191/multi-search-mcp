@@ -2,16 +2,19 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Multi-search MCP server** – 一个轻量级、无需 API 密钥的 MCP 服务器，为 LM Studio 等客户端提供百度、必应、搜狗三引擎聚合搜索能力。内置缓存、反爬策略和结果去重排序，占用极低。
+**Multi-search MCP server** – 一个轻量级、无需 API 密钥的 MCP 服务器，为 LM Studio 等客户端提供百度、必应、搜狗三引擎聚合搜索能力。内置缓存、反爬策略和结果去重排序，**同时支持直接抓取任意 URL 的正文内容**。
 
 ## ✨ 特性
 
 - 🔍 **多引擎聚合** – 同时抓取百度、必应（Bing）、搜狗，合并结果，按相关性排序
 - 🚫 **无需任何 API Key** – 模拟真实浏览器请求，直接抓取公开搜索结果
-- ⚡ **内置缓存** – 相同查询 5 分钟内直接返回缓存，大幅降低重复请求
-- 🛡️ **反爬策略** – User-Agent 轮换 + 请求重试退避，降低被封风险
-- 💾 **极低资源占用** – 仅依赖 Node.js 运行时，内存常驻约 30–50 MB
-- 🔧 **灵活可调** – 可配置缓存时间、最大结果数、超时等参数
+- 📄 **正文抓取** – 自动抓取搜索结果页面的正文内容，为模型提供丰富上下文
+- 🌐 **直接 URL 抓取** – 提供 `fetch_url` 工具，可单独抓取任意网页的正文
+- 🧩 **动态渲染降级** – 当静态抓取失败时，自动启用 Puppeteer 无头浏览器，大幅提升成功率
+- ⚡ **双重缓存** – 搜索结果缓存（5分钟）+ 正文缓存（1小时），减少重复请求
+- 🛡️ **反爬策略** – User-Agent 轮换 + 请求重试退避 + 可选代理
+- 💾 **极低资源占用** – 仅依赖 Node.js 运行时，内存常驻约 30–50 MB（Puppeteer 按需启动）
+- 🔧 **灵活可调** – 可配置缓存时间、最大结果数、超时、抓取引擎等参数
 - 🧩 **适配 LM Studio** – 完美兼容 MCP 协议，即插即用
 
 ## 🚀 快速开始
@@ -19,14 +22,17 @@
 ### 1. 克隆并安装依赖
 
 ```bash
-git clone https://github.com/你的用户名/multi-search-mcp.git（这个用户名后面的路径就不要打了因为我突然发现这个js文件与json文件没有搞文件夹你需要自己创建一个文件夹并放进去）
+git clone https://github.com/你的用户名/multi-search-mcp.git
 cd multi-search-mcp
 npm install
 
 
+    注意：安装过程中会下载 Chromium（约 150MB），首次安装稍慢，但会极大提升动态页面的抓取成功率。
 
 2. 配置 LM Studio
+
 在 LM Studio 的 MCP 设置中编辑 mcp.json（通常位于 ~/.lmstudio/mcp.json 或设置界面内），添加：
+
 {
   "mcpServers": {
     "multi-search": {
@@ -37,26 +43,28 @@ npm install
   }
 }
 
-保存并重启 LM Studio 的 MCP 服务。
 
+
+保存并重启 LM Studio 的 MCP 服务。
 3. 在对话中使用
 
-加载任意支持工具调用的模型（如 Qwen、DeepSeek 等），输入类似：
-text
+加载任意支持工具调用的模型（如 Qwen、DeepSeek 等），输入
+
 
 搜索今天的科技新闻
 
-模型将自动调用 search 工具，返回来自多个引擎的综合结果。
 
-⚙️ 配置参数
+模型将自动调用 search 工具，返回来自多个引擎的综合结果，并附带正文摘要。
 
-在 index.js 开头的 CONFIG 对象中可调整：
-参数	默认值	说明
-cacheTTL	5 * 60 * 1000	缓存有效期（毫秒）
-maxResults	5	默认返回结果条数
-requestTimeout	15000	每个请求超时时间（毫秒）
-maxRetries	2	请求失败重试次数
-🛠️ 工作原理
+你也可以直接让模型抓取特定网页：
+
+
+抓取 https://www.baidu.com
+
+模型会调用 fetch_url 工具，返回该页面的正文内容。
+
+
+搜索流程
 
     查询输入 – 用户或模型发起搜索请求
 
@@ -68,7 +76,40 @@ maxRetries	2	请求失败重试次数
 
     去重与排序 – 按链接去重，根据关键词命中次数 + 来源权重排序
 
-    返回结果 – 将处理后的结构化结果返回给客户端
+    正文抓取 – 对前 maxResults 条结果进行正文抓取（Axios + Puppeteer 降级）
+
+    返回结果 – 将包含正文摘要的结构化结果返回给客户端
+
+URL 直接抓取
+
+    调用 fetch_url 工具，传入 URL
+
+    先尝试 Axios 静态抓取 → 若失败或内容过短，自动降级为 Puppeteer 无头浏览器
+
+    提取页面正文（使用 Readability 或常见容器选择器）
+
+    返回截断后的正文内容
+
+🧩 可用工具
+search
+
+    描述：多引擎搜索 + 自动抓取正文
+
+    参数：
+
+        query (string, 必需) – 搜索关键词
+
+        max_results (number, 可选) – 返回结果数（1-10，默认5）
+
+fetch_url
+
+    描述：直接抓取指定 URL 的正文内容
+
+    参数：
+
+        url (string, 必需) – 完整的网页地址（包含协议）
+
+        max_length (number, 可选) – 返回内容最大长度（默认500）
 
 ⚠️ 注意事项
 
@@ -78,46 +119,55 @@ maxRetries	2	请求失败重试次数
 
     网络环境 – 确保服务器可正常访问上述搜索引擎（国内网络需能直连百度、搜狗，必应可能需代理）。
 
-这个项目在设计和实现上，参考了 MCP 社区中许多优秀的开源项目，主要灵感来源如下：
+    Puppeteer 资源 – 首次启动时会下载 Chromium，之后按需启动无头浏览器，会占用额外内存（约 100-200 MB），但仅在 Axios 抓取失败时触发。
+
+🤝 致谢与参考
+
+本项目在设计和实现上，参考了 MCP 社区中许多优秀的开源项目，主要灵感来源如下：
 📚 百度搜索 MCP 服务器
 
-    caiyili/baidu-search-mcp：核心的百度搜索功能灵感来源。它无需 API Key，直接请求并解析百度页面，对项目影响很深。
+    caiyili/baidu-search-mcp – 核心的百度搜索功能灵感来源
 
-    iflow-mcp/baidu-search-mcp：另一个百度搜索实现，其项目结构和对不同模型的支持提供了参考。
+    iflow-mcp/baidu-search-mcp – 提供项目结构参考
 
-    @alex.ss/mcp-server-baidu-search：同为百度搜索 MCP 服务，提供了不同的实现思路。
+    @alex.ss/mcp-server-baidu-search – 不同实现思路
 
-    Evilran/baidu-mcp-server：同样提供基于百度的网页搜索与内容抓取能力。
+    Evilran/baidu-mcp-server – 提供网页搜索与内容抓取能力
 
 🔍 多引擎搜索 MCP 服务器
 
-    dlmufei/go-web-search-mcp：一个优秀的 Go 语言多引擎搜索实现，项目“多引擎聚合”的核心思想受其启发。
+    dlmufei/go-web-search-mcp – “多引擎聚合”的核心思想
 
-    MemoryClear/claude-web-search-mcp：专为中国用户优化，明确支持百度、搜狗等国产搜索引擎，其“并行搜索”和“智能去重”功能是重要参考。
+    MemoryClear/claude-web-search-mcp – “并行搜索”和“智能去重”
 
-    MetaSearchMCP：一个完整的元搜索后端，其“多提供者聚合”和“结果去重”等设计理念很有价值。
+    MetaSearchMCP – 多提供者聚合与结果去重
 
-    pranavms13/web-search-mcp：通过无头浏览器抓取 Google、DuckDuckGo 和 Bing，提供了另一种技术实现思路。
+    pranavms13/web-search-mcp – 无头浏览器抓取思路
 
-    tamb/simple-web-search-mcp：一个“零配置”的 MCP 服务器，其追求极简配置的理念值得借鉴。
+    tamb/simple-web-search-mcp – 零配置理念
 
 🧩 MCP SDK 与示例
 
-    @modelcontextprotocol/sdk：项目的基础，所有工具和通信都构建在官方提供的 SDK 之上。
+    @modelcontextprotocol/sdk – 项目基础
 
-    Model Context Protocol 官方文档、：理解 MCP 协议、设计服务器 capabilities 和工具接口的根本依据。
+    Model Context Protocol 官方文档 – 协议设计依据
 
 💡 其他灵感来源
 
-    web-research-mcp：提供了“无需 API 密钥”和“并行多查询”等设计思路。
+    web-research-mcp – 无需 API 密钥、并行多查询
 
-    lc-mcp-server：其“模拟模式”为项目的测试和开发提供了参考。
+    lc-mcp-server – 模拟模式
 
-    Tencent/WebSearchMCP：腾讯开源的联网搜索 MCP 服务，展示了企业级 MCP 服务的实现。
+    Tencent/WebSearchMCP – 企业级 MCP 服务实现
 
+📌 开发者说明
 
-注意：1.本mcp编译与开发依赖deepseek，但本人实际实际使用过可以正常运行
-     2.所有内容与这个仓库的一些配置也是deepseek帮助我搞的所以如果有缺陷欢迎指出
-     3.如果您不信任此项目能力那就可以不用克隆此项目了为您节省时间，不过感谢您看完README.md
-     
-最后感谢您下载并使用此项目
+    本 MCP 服务器的编译与开发过程中，得到了 DeepSeek 的辅助，但经过本人实际测试可正常运行。
+
+    所有配置和代码均由 DeepSeek 协助完成，若在使用中发现缺陷，欢迎提交 Issue 或 Pull Request。
+
+    如果您不信任此项目能力，可以选择不克隆使用，感谢您抽空阅读本 README。
+
+最后，感谢您下载并使用本项目！ 🎉
+
+如果您觉得有用，欢迎 Star ⭐ 支持，让更多人受益。
