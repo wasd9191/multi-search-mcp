@@ -19,8 +19,8 @@ const CONFIG = {
   maxRetries: 2,
   maxContentLength: 500,
   fetchTimeout: 10000,
-  usePuppeteerFallback: true,       // 当 axios 失败时尝试 puppeteer
-  proxy: process.env.PROXY || '',   // 可选代理
+  usePuppeteerFallback: true,
+  proxy: process.env.PROXY || '',
 };
 
 // ============================
@@ -63,7 +63,7 @@ const searchCache = new Cache(CONFIG.cacheTTL);
 const contentCache = new Cache(CONFIG.contentCacheTTL);
 
 // ============================
-// 4. 搜索引擎抓取器（与之前相同）
+// 4. 搜索引擎抓取器
 // ============================
 async function fetchBaidu(query, max) {
   const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
@@ -166,7 +166,6 @@ async function fetchWithAxios(url) {
   if (article && article.textContent && article.textContent.length > 50) {
     content = article.textContent.trim();
   } else {
-    // fallback: 常见容器
     const $ = cheerio.load(html);
     const selectors = ['article', 'main', '.content', '#content', '.post-content', '.article-content'];
     for (const sel of selectors) {
@@ -221,7 +220,6 @@ async function fetchPageContent(url) {
     console.error(`Axios 抓取失败: ${err.message}`);
   }
 
-  // 如果内容过短且允许 puppeteer 降级
   if ((!content || content.length < 50) && CONFIG.usePuppeteerFallback) {
     content = await fetchWithPuppeteer(url);
   }
@@ -241,7 +239,6 @@ async function searchAllEngines(query, maxResults) {
   const cached = searchCache.get(cacheKey);
   if (cached) {
     console.error('✅ 命中搜索结果缓存');
-    // 重新抓取正文（利用正文缓存）
     const withContent = await Promise.all(
       cached.map(async (item) => {
         if (item.link) {
@@ -254,7 +251,6 @@ async function searchAllEngines(query, maxResults) {
     return withContent;
   }
 
-  // 并行抓取
   const [baiduRes, bingRes, sogouRes] = await Promise.allSettled([
     fetchBaidu(query, maxResults * 2),
     fetchBing(query, maxResults * 2),
@@ -281,15 +277,22 @@ async function searchAllEngines(query, maxResults) {
     }
   }
 
-  // 排序
+  // 排序（给权威域名加分）
   const keywords = query.split(/\s+/).filter(w => w.length > 1);
+  const authorityDomains = ['kernel.org', 'ubuntu.com', 'debian.org', 'redhat.com', 'microsoft.com', 'github.com', 'arxiv.org', 'tencent.com', 'huawei.com', 'amazon.com'];
   const scored = unique.map(item => {
     let score = 0;
-    const text = (item.title + ' ' + item.snippet).toLowerCase();
+    const text = (item.title + ' ' + (item.snippet || '')).toLowerCase();
     for (const kw of keywords) {
       if (text.includes(kw.toLowerCase())) score += 1;
     }
     if (item.source === 'baidu') score += 0.5;
+    // 权威域名加分
+    if (item.link) {
+      for (const domain of authorityDomains) {
+        if (item.link.includes(domain)) { score += 2; break; }
+      }
+    }
     return { ...item, score };
   });
   scored.sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -307,9 +310,7 @@ async function searchAllEngines(query, maxResults) {
     })
   );
 
-  // 缓存搜索结果（不含正文）
   searchCache.set(cacheKey, finalResults.map(({ content, ...rest }) => rest));
-
   return withContent;
 }
 
@@ -319,7 +320,7 @@ async function searchAllEngines(query, maxResults) {
 const server = new Server(
   {
     name: 'multi-engine-search-mcp',
-    version: '2.2.0',
+    version: '2.3.0',
   },
   {
     capabilities: { tools: {} },
@@ -330,11 +331,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'search',
-      description: '使用百度、必应、搜狗多引擎搜索中文网页，自动合并去重排序，支持缓存，并自动抓取前几条结果的正文内容。',
+      description: '通用搜索引擎，适用于新闻、百科、生活常识等常见话题。',
       inputSchema: {
         type: 'object',
         properties: {
           query: { type: 'string', description: '搜索关键词' },
+          max_results: { type: 'number', description: '返回结果数量（1-10），默认5' },
+        },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'tech_search',
+      description: '🔬 专用技术搜索，用于技术类问题：Linux 内核漏洞、编程框架版本、安全公告、硬件规范、开源项目文档、技术标准等。会优先抓取权威来源（如官方公告、技术博客、安全中心）的最新内容。当用户询问技术细节、漏洞修复、最新版本、编程问题、技术规范时，请优先使用此工具。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '技术相关的搜索关键词，尽量精确，例如“CVE-2026-31431 修复方案”' },
           max_results: { type: 'number', description: '返回结果数量（1-10），默认5' },
         },
         required: ['query'],
@@ -358,24 +371,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  if (name === 'search') {
+  // 通用搜索
+  if (name === 'search' || name === 'tech_search') {
     const { query, max_results = CONFIG.maxResults } = args || {};
     if (!query) throw new Error('缺少查询参数 query');
     const max = Math.min(Math.max(parseInt(max_results) || CONFIG.maxResults, 1), 10);
     const results = await searchAllEngines(query, max);
     if (results.length === 0) {
-      return { content: [{ type: 'text', text: `😅 未找到关于“${query}”的搜索结果。` }] };
+      return { content: [{ type: 'text', text: `😅 未找到关于“${query}”的信息，请尝试其他关键词。` }] };
     }
-    let text = `🔍 搜索“${query}”的结果（共 ${results.length} 条，来自 ${new Set(results.map(r=>r.source)).size} 个引擎）：\n\n`;
+    let label = name === 'tech_search' ? '🔬 技术搜索' : '🔍 通用搜索';
+    let text = `${label}“${query}”的结果（共 ${results.length} 条，来自 ${new Set(results.map(r=>r.source)).size} 个引擎）：\n\n`;
     results.forEach((r, i) => {
       text += `${i+1}. [${r.source}] ${r.title}\n`;
-      text += `   ${r.snippet || '（无摘要）'}\n`;
+      if (r.snippet) text += `   ${r.snippet}\n`;
       if (r.content) text += `   📄 ${r.content}\n`;
       text += `   🔗 ${r.link}\n\n`;
     });
     return { content: [{ type: 'text', text }] };
   }
 
+  // URL 抓取
   if (name === 'fetch_url') {
     const { url, max_length = 500 } = args || {};
     if (!url) throw new Error('缺少 URL 参数');
@@ -395,4 +411,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error('✅ 多引擎搜索 MCP 服务器 v2.2.0 已启动（含 Puppeteer 降级抓取、URL 直接抓取）');
+console.error('✅ 多引擎搜索 MCP 服务器 v2.3.0 已启动（含 tech_search 专用工具）');
